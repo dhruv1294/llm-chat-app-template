@@ -9,6 +9,7 @@ const chatMessages = document.getElementById("chat-messages");
 const userInput = document.getElementById("user-input");
 const sendButton = document.getElementById("send-button");
 const typingIndicator = document.getElementById("typing-indicator");
+const voiceButton = document.getElementById("voice-button");
 
 // Chat state
 let chatHistory = [
@@ -20,12 +21,179 @@ let chatHistory = [
 ];
 let isProcessing = false;
 
-// Auto-resize textarea as user types
-userInput.addEventListener("input", function () {
-	this.style.height = "auto";
-	this.style.height = this.scrollHeight + "px";
-});
+// Session ID for Durable Object / realtime session
+let sessionId = localStorage.getItem("sessionId");
+if (!sessionId) {
+	sessionId = crypto.randomUUID();
+	localStorage.setItem("sessionId", sessionId);
+}
 
+// load existing messages from server-backed Durable Object and render them
+async function loadSessionMessages() {
+    try {
+        const res = await fetch(`/api/messages?sessionId=${sessionId}`);
+        if (!res.ok) return;
+        const msgs = await res.json();
+        if (Array.isArray(msgs) && msgs.length > 0) {
+            chatHistory = msgs;
+            // render
+            chatMessages.innerHTML = "";
+            for (const m of chatHistory) {
+                addMessageToChat(m.role, m.content);
+            }
+        } else {
+            // fallback to default greeting
+            chatMessages.innerHTML = "";
+            addMessageToChat("assistant", "Hello! I'm an LLM chat app powered by Cloudflare Workers AI. How can I help you today?");
+            chatHistory = [ { role: "assistant", content: chatMessages.lastElementChild.querySelector('p').textContent } ];
+        }
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    } catch (e) {
+        console.error("Failed to load session messages:", e);
+    }
+}
+
+// Open websocket connection
+let socket;
+function openSocket() {
+    socket = new WebSocket(`/api/realtime?sessionId=${sessionId}`);
+    socket.addEventListener("open", () => {
+        console.log("realtime socket open");
+    });
+    socket.addEventListener("message", (ev) => {
+        try {
+            const data = JSON.parse(ev.data);
+            if (data.type === "delta") {
+                // append streaming delta to last assistant element
+                const last = chatMessages.lastElementChild;
+                if (last && last.classList.contains("assistant-message")) {
+                    const p = last.querySelector("p");
+                    p.textContent += data.content;
+                }
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+                // cancel transcript timeout since deltas are arriving
+                if (transcriptTimeout) {
+                    clearTimeout(transcriptTimeout);
+                    transcriptTimeout = null;
+                }
+            }
+            if (data.type === "done") {
+                // finalize assistant message
+                const last = chatMessages.lastElementChild;
+                if (last && last.classList.contains("assistant-message")) {
+                    const p = last.querySelector("p");
+                    chatHistory.push({ role: "assistant", content: p.textContent });
+                }
+                typingIndicator.classList.remove("visible");
+                isProcessing = false;
+                userInput.disabled = false;
+                sendButton.disabled = false;
+                userInput.focus();
+            }
+            if (data.type === "transcript") {
+                // Received transcription placeholder
+                addMessageToChat("user", data.content);
+                chatHistory.push({ role: "user", content: data.content });
+
+                // Prepare assistant placeholder so streaming deltas have somewhere to append
+                const assistantMessageEl = document.createElement("div");
+                assistantMessageEl.className = "message assistant-message";
+                assistantMessageEl.innerHTML = "<p></p>";
+                chatMessages.appendChild(assistantMessageEl);
+                typingIndicator.classList.add("visible");
+                isProcessing = true;
+                userInput.disabled = true;
+                sendButton.disabled = true;
+
+                // start a timeout: if no deltas/done arrive in X seconds, recover UI
+                if (transcriptTimeout) clearTimeout(transcriptTimeout);
+                transcriptTimeout = setTimeout(() => {
+                    addMessageToChat("assistant", "Error: response timed out. Please try again.");
+                    typingIndicator.classList.remove("visible");
+                    isProcessing = false;
+                    userInput.disabled = false;
+                    sendButton.disabled = false;
+                    transcriptTimeout = null;
+                }, 30000); // 30s timeout
+            }
+            if (data.type === "error") {
+                addMessageToChat("assistant", "Error: " + data.message);
+                // recover UI from stuck state
+                typingIndicator.classList.remove("visible");
+                isProcessing = false;
+                userInput.disabled = false;
+                sendButton.disabled = false;
+                if (transcriptTimeout) {
+                    clearTimeout(transcriptTimeout);
+                    transcriptTimeout = null;
+                }
+            }
+        } catch (e) {
+            console.error("Malformed socket message", e, ev.data);
+        }
+    });
+}
+
+// initialize session messages then open the socket
+loadSessionMessages().then(openSocket).catch(openSocket);
+
+// Voice recording support
+let mediaRecorder = null;
+let isRecording = false;
+let audioStream = null;
+let transcriptTimeout = null;
+
+voiceButton.addEventListener("click", async () => {
+	if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+		alert("Microphone access not supported in this browser");
+		return;
+	}
+
+	if (!socket || socket.readyState !== WebSocket.OPEN) {
+		alert("Realtime socket not connected");
+		return;
+	}
+
+	if (isRecording) {
+		// stop recording
+		mediaRecorder.stop();
+		if (audioStream) {
+			audioStream.getTracks().forEach((t) => t.stop());
+			audioStream = null;
+		}
+		voiceButton.textContent = "🎤";
+		isRecording = false;
+		return;
+	}
+
+	try {
+		audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		mediaRecorder = new MediaRecorder(audioStream);
+		mediaRecorder.ondataavailable = async (ev) => {
+			if (ev.data && ev.data.size > 0) {
+				const ab = await ev.data.arrayBuffer();
+				try {
+					socket.send(ab);
+				} catch (e) {
+					console.error("Failed to send audio chunk", e);
+				}
+			}
+		};
+		mediaRecorder.onstop = () => {
+			try {
+				socket.send(JSON.stringify({ type: "audio_end" }));
+			} catch (e) {
+				console.error("Failed to send audio_end", e);
+			}
+		};
+		mediaRecorder.start(250); // chunk every 250ms
+		voiceButton.textContent = "⏹️";
+		isRecording = true;
+	} catch (e) {
+		console.error("Microphone access denied or error:", e);
+		alert("Could not access microphone: " + e.message);
+	}
+});
 // Send message on Enter (without Shift)
 userInput.addEventListener("keydown", function (e) {
 	if (e.key === "Enter" && !e.shiftKey) {
@@ -70,124 +238,20 @@ async function sendMessage() {
 		assistantMessageEl.className = "message assistant-message";
 		assistantMessageEl.innerHTML = "<p></p>";
 		chatMessages.appendChild(assistantMessageEl);
-		const assistantTextEl = assistantMessageEl.querySelector("p");
 
 		// Scroll to bottom
 		chatMessages.scrollTop = chatMessages.scrollHeight;
 
-		// Send request to API
-		const response = await fetch("/api/chat", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				messages: chatHistory,
-			}),
-		});
-
-		// Handle errors
-		if (!response.ok) {
-			throw new Error("Failed to get response");
-		}
-		if (!response.body) {
-			throw new Error("Response body is null");
-		}
-
-		// Process streaming response
-		const reader = response.body.getReader();
-		const decoder = new TextDecoder();
-		let responseText = "";
-		let buffer = "";
-		const flushAssistantText = () => {
-			assistantTextEl.textContent = responseText;
-			chatMessages.scrollTop = chatMessages.scrollHeight;
-		};
-
-		let sawDone = false;
-		while (true) {
-			const { done, value } = await reader.read();
-
-			if (done) {
-				// Process any remaining complete events in buffer
-				const parsed = consumeSseEvents(buffer + "\n\n");
-				for (const data of parsed.events) {
-					if (data === "[DONE]") {
-						break;
-					}
-					try {
-						const jsonData = JSON.parse(data);
-						// Handle both Workers AI format (response) and OpenAI format (choices[0].delta.content)
-						let content = "";
-						if (
-							typeof jsonData.response === "string" &&
-							jsonData.response.length > 0
-						) {
-							content = jsonData.response;
-						} else if (jsonData.choices?.[0]?.delta?.content) {
-							content = jsonData.choices[0].delta.content;
-						}
-						if (content) {
-							responseText += content;
-							flushAssistantText();
-						}
-					} catch (e) {
-						console.error("Error parsing SSE data as JSON:", e, data);
-					}
-				}
-				break;
-			}
-
-			// Decode chunk
-			buffer += decoder.decode(value, { stream: true });
-			const parsed = consumeSseEvents(buffer);
-			buffer = parsed.buffer;
-			for (const data of parsed.events) {
-				if (data === "[DONE]") {
-					sawDone = true;
-					buffer = "";
-					break;
-				}
-				try {
-					const jsonData = JSON.parse(data);
-					// Handle both Workers AI format (response) and OpenAI format (choices[0].delta.content)
-					let content = "";
-					if (
-						typeof jsonData.response === "string" &&
-						jsonData.response.length > 0
-					) {
-						content = jsonData.response;
-					} else if (jsonData.choices?.[0]?.delta?.content) {
-						content = jsonData.choices[0].delta.content;
-					}
-					if (content) {
-						responseText += content;
-						flushAssistantText();
-					}
-				} catch (e) {
-					console.error("Error parsing SSE data as JSON:", e, data);
-				}
-			}
-			if (sawDone) {
-				break;
-			}
-		}
-
-		// Add completed response to chat history
-		if (responseText.length > 0) {
-			chatHistory.push({ role: "assistant", content: responseText });
-		}
+		// Send message over websocket
+		socket.send(JSON.stringify({ type: "user_message", content: message }));
 	} catch (error) {
 		console.error("Error:", error);
 		addMessageToChat(
 			"assistant",
 			"Sorry, there was an error processing your request.",
 		);
-	} finally {
-		// Hide typing indicator
-		typingIndicator.classList.remove("visible");
-
 		// Re-enable input
+		typingIndicator.classList.remove("visible");
 		isProcessing = false;
 		userInput.disabled = false;
 		sendButton.disabled = false;

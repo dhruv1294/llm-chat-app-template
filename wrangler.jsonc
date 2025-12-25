@@ -7,7 +7,10 @@
 	"name": "llm-chat-app-template",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-10-08",
-	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+	"compatibility_flags": [
+		"nodejs_compat",
+		"global_fetch_strictly_public"
+	],
 	"assets": {
 		"binding": "ASSETS",
 		"directory": "./public"
@@ -18,5 +21,31 @@
 	"ai": {
 		"binding": "AI"
 	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "CONVERSATION_DO",
+				"class_name": "ConversationDO"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_classes": [
+				"ConversationDO"
+			]
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "CONVERSATIONS",
+			"id": "__PLACEHOLDER__"
+		},
+		{
+			"binding": "conversations",
+			"id": "9f027009436b41bb885a4d2c794d3efe"
+		}
+	],
 	"upload_source_maps": true
 }

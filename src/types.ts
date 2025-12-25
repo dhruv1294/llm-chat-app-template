@@ -12,6 +12,16 @@ export interface Env {
 	 * Binding for static assets.
 	 */
 	ASSETS: { fetch: (request: Request) => Promise<Response> };
+
+	/**
+	 * Durable Object namespace for conversation/session state.
+	 */
+	CONVERSATION_DO: DurableObjectNamespace;
+
+	/**
+	 * Optional KV namespace for long-term conversation summaries / memory.
+	 */
+	CONVERSATIONS?: KVNamespace;
 }
 
 /**
